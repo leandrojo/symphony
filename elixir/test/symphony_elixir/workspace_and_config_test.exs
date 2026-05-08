@@ -429,6 +429,108 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert_receive {:fetch_issue_states_page, ^query, %{ids: ^second_batch_ids, first: 5, relationFirst: 50}}
   end
 
+  test "linear client keeps project slug precedence when team key is also configured" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "symphony",
+      tracker_team_key: "FRE"
+    )
+
+    graphql_fun = fn query, variables ->
+      send(self(), {:project_poll, query, variables})
+
+      {:ok,
+       %{
+         "data" => %{
+           "issues" => %{
+             "nodes" => [
+               %{
+                 "id" => "issue-1",
+                 "identifier" => "SYM-1",
+                 "title" => "Project issue",
+                 "state" => %{"name" => "Todo"},
+                 "labels" => %{"nodes" => []},
+                 "inverseRelations" => %{"nodes" => []}
+               }
+             ],
+             "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+           }
+         }
+       }}
+    end
+
+    assert {:ok, [%Issue{identifier: "SYM-1"}]} = Client.fetch_candidate_issues_for_test(graphql_fun)
+
+    assert_receive {:project_poll, query,
+                    %{
+                      filter: %{
+                        project: %{slugId: %{eq: "symphony"}},
+                        state: %{name: %{in: ["Todo", "In Progress"]}}
+                      },
+                      first: 50,
+                      relationFirst: 50
+                    }}
+
+    assert query =~ "SymphonyLinearPoll"
+    assert query =~ "$filter: IssueFilter!"
+    assert query =~ "issues(filter: $filter"
+  end
+
+  test "linear client can poll candidate issues by team key and label selection" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: nil,
+      tracker_team_key: "FRE",
+      tracker_required_labels: ["agent-ready"],
+      tracker_excluded_labels: ["agent-blocked", "human-only"]
+    )
+
+    raw_issue = fn id, identifier, labels ->
+      %{
+        "id" => id,
+        "identifier" => identifier,
+        "title" => "Issue #{identifier}",
+        "description" => "Description #{identifier}",
+        "state" => %{"name" => "Todo"},
+        "labels" => %{"nodes" => Enum.map(labels, &%{"name" => &1})},
+        "inverseRelations" => %{"nodes" => []}
+      }
+    end
+
+    graphql_fun = fn query, variables ->
+      send(self(), {:team_poll, query, variables})
+
+      {:ok,
+       %{
+         "data" => %{
+           "issues" => %{
+             "nodes" => [
+               raw_issue.("issue-1", "FRE-1", ["agent-ready"]),
+               raw_issue.("issue-2", "FRE-2", ["agent-ready", "agent-blocked"]),
+               raw_issue.("issue-3", "FRE-3", ["feature"])
+             ],
+             "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+           }
+         }
+       }}
+    end
+
+    assert {:ok, issues} = Client.fetch_candidate_issues_for_test(graphql_fun)
+    assert Enum.map(issues, & &1.identifier) == ["FRE-1"]
+
+    assert_receive {:team_poll, query,
+                    %{
+                      filter: %{
+                        team: %{key: %{eq: "FRE"}},
+                        state: %{name: %{in: ["Todo", "In Progress"]}}
+                      },
+                      first: 50,
+                      relationFirst: 50
+                    }}
+
+    assert query =~ "SymphonyLinearPoll"
+    assert query =~ "$filter: IssueFilter!"
+    assert query =~ "issues(filter: $filter"
+  end
+
   test "linear client logs response bodies for non-200 graphql responses" do
     log =
       ExUnit.CaptureLog.capture_log(fn ->

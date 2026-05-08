@@ -10,8 +10,8 @@ defmodule SymphonyElixir.Linear.Client do
   @max_error_body_log_bytes 1_000
 
   @query """
-  query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
-    issues(filter: {project: {slugId: {eq: $projectSlug}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) {
+  query SymphonyLinearPoll($filter: IssueFilter!, $first: Int!, $relationFirst: Int!, $after: String) {
+    issues(filter: $filter, first: $first, after: $after) {
       nodes {
         id
         identifier
@@ -105,20 +105,15 @@ defmodule SymphonyElixir.Linear.Client do
 
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
-    tracker = Config.settings!().tracker
-    project_slug = tracker.project_slug
+    settings = Config.settings!()
+    tracker = settings.tracker
 
-    cond do
-      is_nil(tracker.api_key) ->
-        {:error, :missing_linear_api_token}
-
-      is_nil(project_slug) ->
-        {:error, :missing_linear_project_slug}
-
-      true ->
-        with {:ok, assignee_filter} <- routing_assignee_filter() do
-          do_fetch_by_states(project_slug, tracker.active_states, assignee_filter)
-        end
+    if is_nil(tracker.api_key) do
+      {:error, :missing_linear_api_token}
+    else
+      with {:ok, assignee_filter} <- routing_assignee_filter() do
+        do_fetch_candidates(settings, tracker.active_states, assignee_filter, &graphql/2)
+      end
     end
   end
 
@@ -129,18 +124,13 @@ defmodule SymphonyElixir.Linear.Client do
     if normalized_states == [] do
       {:ok, []}
     else
-      tracker = Config.settings!().tracker
-      project_slug = tracker.project_slug
+      settings = Config.settings!()
+      tracker = settings.tracker
 
-      cond do
-        is_nil(tracker.api_key) ->
-          {:error, :missing_linear_api_token}
-
-        is_nil(project_slug) ->
-          {:error, :missing_linear_project_slug}
-
-        true ->
-          do_fetch_by_states(project_slug, normalized_states, nil)
+      if is_nil(tracker.api_key) do
+        {:error, :missing_linear_api_token}
+      else
+        do_fetch_by_scope(settings, normalized_states, nil, &graphql/2)
       end
     end
   end
@@ -236,25 +226,66 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
-  defp do_fetch_by_states(project_slug, state_names, assignee_filter) do
-    do_fetch_by_states_page(project_slug, state_names, assignee_filter, nil, [])
+  @doc false
+  @spec fetch_candidate_issues_for_test((String.t(), map() -> {:ok, map()} | {:error, term()})) ::
+          {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_candidate_issues_for_test(graphql_fun) when is_function(graphql_fun, 2) do
+    settings = Config.settings!()
+    do_fetch_candidates(settings, settings.tracker.active_states, nil, graphql_fun)
   end
 
-  defp do_fetch_by_states_page(project_slug, state_names, assignee_filter, after_cursor, acc_issues) do
+  defp do_fetch_candidates(settings, state_names, assignee_filter, graphql_fun) do
+    with {:ok, issues} <- do_fetch_by_scope(settings, state_names, assignee_filter, graphql_fun) do
+      {:ok, filter_candidate_issues(issues, settings.tracker)}
+    end
+  end
+
+  defp do_fetch_by_scope(settings, state_names, assignee_filter, graphql_fun) do
+    case tracker_scope(settings.tracker) do
+      {:project, project_slug} ->
+        do_fetch_by_project_states(project_slug, state_names, assignee_filter, graphql_fun)
+
+      {:team, team_key} ->
+        do_fetch_by_team_states(team_key, state_names, assignee_filter, graphql_fun)
+
+      :missing ->
+        {:error, :missing_linear_project_slug}
+    end
+  end
+
+  defp do_fetch_by_project_states(project_slug, state_names, assignee_filter, graphql_fun) do
+    %{project: %{slugId: %{eq: project_slug}}}
+    |> scoped_issue_filter(state_names)
+    |> do_fetch_by_states_page(assignee_filter, graphql_fun, nil, [])
+  end
+
+  defp do_fetch_by_team_states(team_key, state_names, assignee_filter, graphql_fun) do
+    %{team: %{key: %{eq: team_key}}}
+    |> scoped_issue_filter(state_names)
+    |> do_fetch_by_states_page(assignee_filter, graphql_fun, nil, [])
+  end
+
+  defp scoped_issue_filter(scope_filter, state_names) when is_map(scope_filter) and is_list(state_names) do
+    Map.put(scope_filter, :state, %{name: %{in: state_names}})
+  end
+
+  defp do_fetch_by_states_page(filter, assignee_filter, graphql_fun, after_cursor, acc_issues) do
     with {:ok, body} <-
-           graphql(@query, %{
-             projectSlug: project_slug,
-             stateNames: state_names,
-             first: @issue_page_size,
-             relationFirst: @issue_page_size,
-             after: after_cursor
-           }),
+           graphql_fun.(
+             @query,
+             %{
+               filter: filter,
+               first: @issue_page_size,
+               relationFirst: @issue_page_size,
+               after: after_cursor
+             }
+           ),
          {:ok, issues, page_info} <- decode_linear_page_response(body, assignee_filter) do
       updated_acc = prepend_page_issues(issues, acc_issues)
 
       case next_page_cursor(page_info) do
         {:ok, next_cursor} ->
-          do_fetch_by_states_page(project_slug, state_names, assignee_filter, next_cursor, updated_acc)
+          do_fetch_by_states_page(filter, assignee_filter, graphql_fun, next_cursor, updated_acc)
 
         :done ->
           {:ok, finalize_paginated_issues(updated_acc)}
@@ -270,6 +301,58 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp finalize_paginated_issues(acc_issues) when is_list(acc_issues), do: Enum.reverse(acc_issues)
+
+  defp tracker_scope(tracker) do
+    case normalize_non_empty(tracker.project_slug) do
+      nil ->
+        case normalize_non_empty(tracker.team_key) do
+          nil -> :missing
+          team_key -> {:team, team_key}
+        end
+
+      project_slug ->
+        {:project, project_slug}
+    end
+  end
+
+  defp normalize_non_empty(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp normalize_non_empty(_value), do: nil
+
+  defp filter_candidate_issues(issues, selection) when is_list(issues) do
+    required_labels = normalized_labels(selection.required_labels)
+    excluded_labels = normalized_labels(selection.excluded_labels)
+
+    Enum.filter(issues, fn %Issue{labels: labels} ->
+      issue_labels = normalized_labels(labels)
+
+      Enum.all?(required_labels, &(&1 in issue_labels)) and
+        not Enum.any?(excluded_labels, &(&1 in issue_labels))
+    end)
+  end
+
+  defp normalized_labels(labels) when is_list(labels) do
+    labels
+    |> Enum.map(&normalize_label/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  defp normalized_labels(_labels), do: []
+
+  defp normalize_label(label) when is_binary(label) do
+    case label |> String.trim() |> String.downcase() do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp normalize_label(_label), do: nil
 
   defp do_fetch_issue_states(ids, assignee_filter) do
     do_fetch_issue_states(ids, assignee_filter, &graphql/2)

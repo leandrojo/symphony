@@ -2,6 +2,11 @@
 tracker:
   kind: linear
   project_slug: "symphony-0c79b11b75ea"
+  # Use team_key instead of project_slug to poll every active issue in a Linear team.
+  # team_key: "ENG"
+  # Optional candidate filters.
+  # required_labels: ["agent-ready"]
+  # excluded_labels: ["human-only"]
   active_states:
     - Todo
     - In Progress

@@ -90,6 +90,11 @@ Minimal example:
 tracker:
   kind: linear
   project_slug: "..."
+  # Use team_key instead of project_slug to poll every active issue in a Linear team.
+  # team_key: "ENG"
+  # Optional candidate filters.
+  # required_labels: ["agent-ready"]
+  # excluded_labels: ["human-only"]
 workspace:
   root: ~/code/workspaces
 hooks:
@@ -128,6 +133,10 @@ Notes:
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
+- `tracker.project_slug` is the default Linear scope. If no project slug is configured,
+  `tracker.team_key` polls active issues for that Linear team instead.
+- `tracker.required_labels` and `tracker.excluded_labels` are optional Linear label filters applied
+  before dispatch.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the

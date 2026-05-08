@@ -49,6 +49,19 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, :missing_linear_project_slug} = Config.validate!()
 
     write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: "token",
+      tracker_project_slug: nil,
+      tracker_team_key: "FRE",
+      tracker_required_labels: ["agent-ready"],
+      tracker_excluded_labels: ["agent-blocked"]
+    )
+
+    assert :ok = Config.validate!()
+    assert Config.settings!().tracker.team_key == "FRE"
+    assert Config.settings!().tracker.required_labels == ["agent-ready"]
+    assert Config.settings!().tracker.excluded_labels == ["agent-blocked"]
+
+    write_workflow_file!(Workflow.workflow_file_path(),
       tracker_project_slug: "project",
       codex_command: ""
     )
@@ -544,8 +557,7 @@ defmodule SymphonyElixir.CoreTest do
     end)
 
     send(pid, {:DOWN, ref, :process, self(), :normal})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    state = wait_for_retry_attempt(pid, issue_id)
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
@@ -585,8 +597,7 @@ defmodule SymphonyElixir.CoreTest do
     end)
 
     send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    state = wait_for_retry_attempt(pid, issue_id)
 
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
@@ -624,8 +635,7 @@ defmodule SymphonyElixir.CoreTest do
     end)
 
     send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    state = wait_for_retry_attempt(pid, issue_id)
 
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
@@ -755,6 +765,21 @@ defmodule SymphonyElixir.CoreTest do
 
     assert remaining_ms >= min_remaining_ms
     assert remaining_ms <= max_remaining_ms
+  end
+
+  defp wait_for_retry_attempt(pid, issue_id, attempts_remaining \\ 20)
+
+  defp wait_for_retry_attempt(pid, _issue_id, 0), do: :sys.get_state(pid)
+
+  defp wait_for_retry_attempt(pid, issue_id, attempts_remaining) do
+    state = :sys.get_state(pid)
+
+    if Map.has_key?(state.retry_attempts, issue_id) do
+      state
+    else
+      Process.sleep(5)
+      wait_for_retry_attempt(pid, issue_id, attempts_remaining - 1)
+    end
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)

@@ -941,9 +941,9 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
     end)
 
+    tick_started_ms = System.monotonic_time(:millisecond)
     send(pid, :tick)
-    Process.sleep(100)
-    state = :sys.get_state(pid)
+    state = wait_for_retry_attempt_state(pid, issue_id)
 
     refute Process.alive?(worker_pid)
     refute Map.has_key?(state.running, issue_id)
@@ -956,9 +956,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            } = state.retry_attempts[issue_id]
 
     assert is_integer(due_at_ms)
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-    assert remaining_ms >= 9_500
-    assert remaining_ms <= 10_500
+    assert due_at_ms >= tick_started_ms + 9_500
+    assert due_at_ms <= System.monotonic_time(:millisecond) + 10_500
   end
 
   test "status dashboard renders offline marker to terminal" do
@@ -1555,6 +1554,26 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   defp wait_for_snapshot(pid, predicate, timeout_ms \\ 200) when is_function(predicate, 1) do
     deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
     do_wait_for_snapshot(pid, predicate, deadline_ms)
+  end
+
+  defp wait_for_retry_attempt_state(pid, issue_id, timeout_ms \\ 200) do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+    do_wait_for_retry_attempt_state(pid, issue_id, deadline_ms)
+  end
+
+  defp do_wait_for_retry_attempt_state(pid, issue_id, deadline_ms) do
+    state = :sys.get_state(pid)
+
+    if Map.has_key?(state.retry_attempts, issue_id) do
+      state
+    else
+      if System.monotonic_time(:millisecond) >= deadline_ms do
+        flunk("timed out waiting for retry attempt state: #{inspect(state.retry_attempts)}")
+      else
+        Process.sleep(5)
+        do_wait_for_retry_attempt_state(pid, issue_id, deadline_ms)
+      end
+    end
   end
 
   defp do_wait_for_snapshot(pid, predicate, deadline_ms) do
