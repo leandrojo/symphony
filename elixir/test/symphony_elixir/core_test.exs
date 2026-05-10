@@ -162,6 +162,55 @@ defmodule SymphonyElixir.CoreTest do
     assert Config.settings!().tracker.assignee == env_assignee
   end
 
+  test "reserving a Todo issue moves it to In Progress before dispatch" do
+    issue = %Issue{
+      id: "issue-1",
+      identifier: "AGE-1",
+      title: "Bootstrap project harness",
+      state: "Todo"
+    }
+
+    assert {:ok, reserved_issue} =
+             Orchestrator.reserve_issue_for_dispatch_for_test(issue, fn issue_id, state_name ->
+               send(self(), {:state_update, issue_id, state_name})
+               :ok
+             end)
+
+    assert_receive {:state_update, "issue-1", "In Progress"}
+    assert reserved_issue.state == "In Progress"
+  end
+
+  test "reserving an already in-progress issue does not update tracker state" do
+    issue = %Issue{
+      id: "issue-2",
+      identifier: "AGE-2",
+      title: "Continue current work",
+      state: "In Progress"
+    }
+
+    assert {:ok, ^issue} =
+             Orchestrator.reserve_issue_for_dispatch_for_test(issue, fn issue_id, state_name ->
+               send(self(), {:unexpected_state_update, issue_id, state_name})
+               :ok
+             end)
+
+    refute_receive {:unexpected_state_update, _issue_id, _state_name}
+  end
+
+  test "reserving a Todo issue fails closed when tracker state update fails" do
+    issue = %Issue{
+      id: "issue-3",
+      identifier: "AGE-3",
+      title: "Do not dispatch without reservation",
+      state: "Todo"
+    }
+
+    assert {:error, {:issue_reservation_failed, "In Progress", :state_not_found}} =
+             Orchestrator.reserve_issue_for_dispatch_for_test(issue, fn _issue_id, _state_name ->
+               {:error, :state_not_found}
+             end)
+  end
+
   test "workflow file path defaults to WORKFLOW.md in the current working directory when app env is unset" do
     original_workflow_path = Workflow.workflow_file_path()
 
