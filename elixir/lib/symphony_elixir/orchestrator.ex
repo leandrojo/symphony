@@ -11,6 +11,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
+  @dispatch_reservation_target_state "In Progress"
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
@@ -319,6 +320,14 @@ defmodule SymphonyElixir.Orchestrator do
   def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
       when is_function(issue_fetcher, 1) do
     revalidate_issue_for_dispatch(issue, issue_fetcher, terminal_state_set())
+  end
+
+  @doc false
+  @spec reserve_issue_for_dispatch_for_test(Issue.t(), (String.t(), String.t() -> term())) ::
+          {:ok, Issue.t()} | {:error, term()}
+  def reserve_issue_for_dispatch_for_test(%Issue{} = issue, state_updater)
+      when is_function(state_updater, 2) do
+    reserve_issue_for_dispatch(issue, state_updater)
   end
 
   @doc false
@@ -660,7 +669,14 @@ defmodule SymphonyElixir.Orchestrator do
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        case reserve_issue_for_dispatch(refreshed_issue, &Tracker.update_issue_state/2) do
+          {:ok, %Issue{} = reserved_issue} ->
+            do_dispatch_issue(state, reserved_issue, attempt, preferred_worker_host)
+
+          {:error, reason} ->
+            Logger.warning("Skipping dispatch; failed to reserve #{issue_context(refreshed_issue)}: #{inspect(reason)}")
+            state
+        end
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
@@ -676,6 +692,32 @@ defmodule SymphonyElixir.Orchestrator do
         state
     end
   end
+
+  defp reserve_issue_for_dispatch(%Issue{} = issue, state_updater)
+       when is_function(state_updater, 2) do
+    if issue_requires_reservation?(issue) do
+      case state_updater.(issue.id, @dispatch_reservation_target_state) do
+        :ok ->
+          Logger.info("Reserved issue for agent dispatch: #{issue_context(issue)} state=#{@dispatch_reservation_target_state}")
+          {:ok, %{issue | state: @dispatch_reservation_target_state}}
+
+        {:error, reason} ->
+          {:error, {:issue_reservation_failed, @dispatch_reservation_target_state, reason}}
+
+        other ->
+          {:error, {:issue_reservation_failed, @dispatch_reservation_target_state, other}}
+      end
+    else
+      {:ok, issue}
+    end
+  end
+
+  defp issue_requires_reservation?(%Issue{id: issue_id, state: state_name})
+       when is_binary(issue_id) and is_binary(state_name) do
+    normalize_issue_state(state_name) == "todo"
+  end
+
+  defp issue_requires_reservation?(_issue), do: false
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
